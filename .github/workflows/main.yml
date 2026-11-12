@@ -17,7 +17,7 @@ jobs:
 
       - name: 라이브러리 설치 및 EXE 빌드
         run: |
-          pip install openpyxl tkinterdnd2 pyinstaller
+          pip install pywin32 tkinterdnd2 pyinstaller
           pyinstaller --onefile --noconsole --collect-all tkinterdnd2 excel_cleaner_app.py
 
       - name: 완성된 EXE 파일 업로드
