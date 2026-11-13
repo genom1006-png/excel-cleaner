@@ -7,6 +7,50 @@ import win32com.client
 
 queued_files = []
 
+INTERNAL_FAST_MACRO = """
+Sub UltraFastClean(targetWb As Workbook)
+    Dim nm As Name
+    Dim lnk As Variant
+    Dim linkArr As Variant
+    Dim nmName As String
+    Dim shortName As String
+    Dim exclPos As Long
+    Dim i As Long
+    
+    On Error Resume Next
+    
+    linkArr = targetWb.LinkSources(1)
+    If Not IsEmpty(linkArr) Then
+        For Each lnk In linkArr
+            targetWb.BreakLink Name:=lnk, Type:=1
+        Next lnk
+    End If
+    
+    For i = targetWb.Names.Count To 1 Step -1
+        Set nm = targetWb.Names(i)
+        nmName = nm.Name
+        exclPos = InStrRev(nmName, "!")
+        If exclPos > 0 Then
+            shortName = Mid$(nmName, exclPos + 1)
+        Else
+            shortName = nmName
+        End If
+        
+        If Left$(shortName, 6) <> "_xlnm." And _
+           Left$(shortName, 10) <> "Print_Area" And _
+           Left$(shortName, 12) <> "Print_Titles" And _
+           Left$(shortName, 15) <> "_FilterDatabase" And _
+           Left$(shortName, 16) <> "Consolidate_Area" And _
+           Left$(shortName, 8) <> "Criteria" And _
+           Left$(shortName, 8) <> "Database" And _
+           Left$(shortName, 7) <> "Extract" And _
+           Left$(shortName, 11) <> "Sheet_Title" Then
+            nm.Delete
+        End If
+    Next i
+End Sub
+"""
+
 
 def add_files(file_paths):
   valid_exts = (".xlsx", ".xlsm", ".xls")
@@ -60,6 +104,45 @@ def update_status(msg, color="#0052CC"):
   root.update()
 
 
+def fallback_com_clean(wb, idx, total):
+  system_prefixes = (
+      "_xlnm.",
+      "Print_Area",
+      "Print_Titles",
+      "_FilterDatabase",
+      "Consolidate_Area",
+      "Criteria",
+      "Database",
+      "Extract",
+      "Sheet_Title",
+  )
+  links = wb.LinkSources(1)
+  if links:
+    for lnk in links:
+      try:
+        wb.BreakLink(Name=lnk, Type=1)
+      except Exception:
+        pass
+
+  names_col = wb.Names
+  total_names = names_col.Count
+  for i in range(total_names, 0, -1):
+    if i % 1000 == 0:
+      update_status(
+          f"[{idx}/{total}] 호환 모드 정리 중... ({total_names - i:,} /"
+          f" {total_names:,})"
+      )
+    try:
+      nm = names_col.Item(i)
+      nm_str = nm.Name
+      excl_idx = nm_str.rfind("!")
+      short_name = nm_str[excl_idx + 1 :] if excl_idx != -1 else nm_str
+      if not short_name.startswith(system_prefixes):
+        nm.Delete()
+    except Exception:
+      pass
+
+
 def start_processing():
   if not queued_files:
     messagebox.showinfo(
@@ -76,24 +159,15 @@ def start_processing():
   success_count = 0
   error_files = []
 
-  system_prefixes = (
-      "_xlnm.",
-      "Print_Area",
-      "Print_Titles",
-      "_FilterDatabase",
-      "Consolidate_Area",
-      "Criteria",
-      "Database",
-      "Extract",
-      "Sheet_Title",
-  )
-
   pythoncom.CoInitialize()
   excel = None
+  helper_wb = None
+  use_internal_macro = False
   created_new_excel = False
+  orig_calc = -4105
 
   try:
-    update_status("⚡ 엑셀 연결 중...", "#D97706")
+    update_status("⚡ 엑셀 고속 엔진 연결 중...", "#D97706")
     try:
       excel = win32com.client.GetActiveObject("Excel.Application")
     except Exception:
@@ -103,16 +177,30 @@ def start_processing():
     excel.Visible = True
     excel.DisplayAlerts = False
     excel.AskToUpdateLinks = False
-    excel.AutomationSecurity = 3
+    excel.AutomationSecurity = 1
+
+    try:
+      helper_wb = excel.Workbooks.Add()
+      vb_mod = helper_wb.VBProject.VBComponents.Add(1)
+      vb_mod.CodeModule.AddFromString(INTERNAL_FAST_MACRO)
+      use_internal_macro = True
+    except Exception:
+      if helper_wb:
+        try:
+          helper_wb.Close(SaveChanges=False)
+        except Exception:
+          pass
+        helper_wb = None
+      use_internal_macro = False
 
     for idx, file_path in enumerate(queued_files, start=1):
       base_name = os.path.basename(file_path)
       wb = None
       try:
-        update_status(f"[{idx}/{total}] 1/4 파일 여는 중: {base_name}")
+        update_status(f"[{idx}/{total}] 파일 여는 중: {base_name}")
         abs_path = os.path.abspath(file_path)
 
-        # UpdateLinks=0(업데이트 안함), ReadOnly=False, CorruptLoad=0
+        excel.EnableEvents = False
         wb = excel.Workbooks.Open(
             abs_path,
             UpdateLinks=0,
@@ -121,48 +209,33 @@ def start_processing():
             Notify=False,
         )
 
-        # 열리자마자 자동 계산 끄기
         orig_calc = excel.Calculation
-        excel.Calculation = -4135  # 수동 계산
+        excel.Calculation = -4135
         excel.ScreenUpdating = False
+        try:
+          excel.PrintCommunication = False
+        except Exception:
+          pass
 
         try:
-          # 2단계: 외부 연결 끊기
-          update_status(f"[{idx}/{total}] 2/4 외부 연결 제거 중: {base_name}")
-          links = wb.LinkSources(1)
-          if links:
-            for lnk in links:
-              try:
-                wb.BreakLink(Name=lnk, Type=1)
-              except Exception:
-                pass
-
-          # 3단계: 이름 관리자 삭제
-          total_names = wb.Names.Count
-          update_status(
-              f"[{idx}/{total}] 3/4 이름 정리 중 (총 {total_names}개)..."
-          )
-
-          for i in range(total_names, 0, -1):
-            if i % 200 == 0:
-              update_status(
-                  f"[{idx}/{total}] 3/4 이름 정리 중... ({total_names - i} /"
-                  f" {total_names})"
-              )
-            try:
-              nm = wb.Names.Item(i)
-              short_name = nm.Name.split("!")[-1]
-              if not short_name.startswith(system_prefixes):
-                nm.Delete()
-            except Exception:
-              pass
-
+          if use_internal_macro and helper_wb:
+            update_status(
+                f"[{idx}/{total}] 🚀 초고속 메모리 일괄 정리 중: {base_name}"
+            )
+            macro_name = f"'{helper_wb.Name}'!UltraFastClean"
+            excel.Run(macro_name, wb)
+          else:
+            fallback_com_clean(wb, idx, total)
         finally:
           excel.Calculation = orig_calc
           excel.ScreenUpdating = True
+          excel.EnableEvents = True
+          try:
+            excel.PrintCommunication = True
+          except Exception:
+            pass
 
-        # 4단계: 저장
-        update_status(f"[{idx}/{total}] 4/4 저장 중: {base_name}", "#217346")
+        update_status(f"[{idx}/{total}] 💾 저장 중: {base_name}", "#217346")
         dir_name = os.path.dirname(abs_path)
         name_only, ext = os.path.splitext(base_name)
         new_path = os.path.join(dir_name, f"{name_only}_정리완료{ext}")
@@ -173,6 +246,7 @@ def start_processing():
 
       except Exception as e:
         excel.ScreenUpdating = True
+        excel.EnableEvents = True
         if wb:
           try:
             wb.Close(SaveChanges=False)
@@ -184,6 +258,11 @@ def start_processing():
       root.update()
 
   finally:
+    if helper_wb:
+      try:
+        helper_wb.Close(SaveChanges=False)
+      except Exception:
+        pass
     if excel and created_new_excel:
       try:
         excel.Quit()
@@ -202,9 +281,8 @@ def start_processing():
   clear_list()
 
 
-# --- 메인 윈도우 GUI 구성 ---
 root = TkinterDnD.Tk()
-root.title("엑셀 연결/이름 제거기")
+root.title("엑셀 초고속 연결/이름 제거기")
 root.geometry("460x380")
 root.resizable(False, False)
 
