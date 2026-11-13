@@ -1,5 +1,4 @@
 import os
-import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import pythoncom
@@ -7,53 +6,6 @@ from tkinterdnd2 import DND_FILES, TkinterDnD
 import win32com.client
 
 queued_files = []
-
-# 엑셀 내부에 주입해 1초 만에 실행할 초고속 VBA 매크로 코드
-FAST_VBA_CODE = """
-Sub FastCleanWorkbook(targetWb As Workbook)
-    Dim nm As Name
-    Dim lnk As Variant
-    Dim linkArr As Variant
-    Dim nmName As String
-    Dim shortName As String
-    Dim exclPos As Long
-    Dim i As Long
-    
-    On Error Resume Next
-    
-    ' 1. 외부 통합문서 연결 끊기
-    linkArr = targetWb.LinkSources(1)
-    If Not IsEmpty(linkArr) Then
-        For Each lnk In linkArr
-            targetWb.BreakLink Name:=lnk, Type:=1
-        Next lnk
-    End If
-    
-    ' 2. 이름 관리자 초고속 일괄 삭제 (기본 시스템 이름 보존)
-    For i = targetWb.Names.Count To 1 Step -1
-        Set nm = targetWb.Names(i)
-        nmName = nm.Name
-        exclPos = InStrRev(nmName, "!")
-        If exclPos > 0 Then
-            shortName = Mid$(nmName, exclPos + 1)
-        Else
-            shortName = nmName
-        End If
-        
-        If Left$(shortName, 6) <> "_xlnm." And _
-           Left$(shortName, 10) <> "Print_Area" And _
-           Left$(shortName, 12) <> "Print_Titles" And _
-           Left$(shortName, 15) <> "_FilterDatabase" And _
-           Left$(shortName, 16) <> "Consolidate_Area" And _
-           Left$(shortName, 8) <> "Criteria" And _
-           Left$(shortName, 8) <> "Database" And _
-           Left$(shortName, 7) <> "Extract" And _
-           Left$(shortName, 11) <> "Sheet_Title" Then
-            nm.Delete
-        End If
-    Next i
-End Sub
-"""
 
 
 def add_files(file_paths):
@@ -71,11 +23,6 @@ def add_files(file_paths):
             f"총 {len(queued_files)}개 파일 대기 중 ('작업 시작' 버튼을 누르세요)"
         ),
         fg="#217346",
-    )
-  elif file_paths:
-    messagebox.showwarning(
-        "파일 확인",
-        "추가할 수 있는 새 엑셀 파일(.xlsx, .xlsm, .xls)이 없습니다.",
     )
 
 
@@ -105,6 +52,12 @@ def set_ui_state(is_running):
   btn_add.config(state=state)
   btn_clear.config(state=state)
   btn_start.config(state=state)
+  root.update()
+
+
+def update_status(msg, color="#0052CC"):
+  status_label.config(text=msg, fg=color)
+  root.update()
 
 
 def start_processing():
@@ -115,31 +68,32 @@ def start_processing():
     return
 
   set_ui_state(True)
-  progress_bar["maximum"] = len(queued_files)
+  total = len(queued_files)
+  progress_bar["maximum"] = total
   progress_bar["value"] = 0
+  root.update()
 
-  thread = threading.Thread(target=process_worker, daemon=True)
-  thread.start()
-
-
-def process_worker():
   success_count = 0
   error_files = []
-  total = len(queued_files)
+
+  system_prefixes = (
+      "_xlnm.",
+      "Print_Area",
+      "Print_Titles",
+      "_FilterDatabase",
+      "Consolidate_Area",
+      "Criteria",
+      "Database",
+      "Extract",
+      "Sheet_Title",
+  )
 
   pythoncom.CoInitialize()
   excel = None
-  helper_wb = None
   created_new_excel = False
 
   try:
-    root.after(
-        0,
-        lambda: status_label.config(
-            text="⚡ 초고속 매크로 엔진 준비 중...", fg="#D97706"
-        ),
-    )
-
+    update_status("⚡ 엑셀 연결 중...", "#D97706")
     try:
       excel = win32com.client.GetActiveObject("Excel.Application")
     except Exception:
@@ -149,33 +103,66 @@ def process_worker():
     excel.Visible = True
     excel.DisplayAlerts = False
     excel.AskToUpdateLinks = False
-    excel.ScreenUpdating = False
-    excel.EnableEvents = False
-    orig_calc = excel.Calculation
-    excel.Calculation = -4135  # 수동 계산
-
-    # 매크로 실행용 임시 통합 문서 생성 후 VBA 코드 주입
-    helper_wb = excel.Workbooks.Add()
-    vb_module = helper_wb.VBProject.VBComponents.Add(1)  # 1 = vbext_ct_StdModule
-    vb_module.CodeModule.AddFromString(FAST_VBA_CODE)
+    excel.AutomationSecurity = 3
 
     for idx, file_path in enumerate(queued_files, start=1):
       base_name = os.path.basename(file_path)
       wb = None
       try:
-        root.after(
-            0,
-            lambda i=idx, name=base_name: status_label.config(
-                text=f"🚀 초고속 정리 중 ({i}/{total}): {name}", fg="#0052CC"
-            ),
+        update_status(f"[{idx}/{total}] 1/4 파일 여는 중: {base_name}")
+        abs_path = os.path.abspath(file_path)
+
+        # UpdateLinks=0(업데이트 안함), ReadOnly=False, CorruptLoad=0
+        wb = excel.Workbooks.Open(
+            abs_path,
+            UpdateLinks=0,
+            ReadOnly=False,
+            IgnoreReadOnlyRecommended=True,
+            Notify=False,
         )
 
-        abs_path = os.path.abspath(file_path)
-        wb = excel.Workbooks.Open(abs_path, UpdateLinks=0, ReadOnly=False)
+        # 열리자마자 자동 계산 끄기
+        orig_calc = excel.Calculation
+        excel.Calculation = -4135  # 수동 계산
+        excel.ScreenUpdating = False
 
-        # 주입된 VBA 매크로를 엑셀 내부에서 직접 고속 실행
-        excel.Run("FastCleanWorkbook", wb)
+        try:
+          # 2단계: 외부 연결 끊기
+          update_status(f"[{idx}/{total}] 2/4 외부 연결 제거 중: {base_name}")
+          links = wb.LinkSources(1)
+          if links:
+            for lnk in links:
+              try:
+                wb.BreakLink(Name=lnk, Type=1)
+              except Exception:
+                pass
 
+          # 3단계: 이름 관리자 삭제
+          total_names = wb.Names.Count
+          update_status(
+              f"[{idx}/{total}] 3/4 이름 정리 중 (총 {total_names}개)..."
+          )
+
+          for i in range(total_names, 0, -1):
+            if i % 200 == 0:
+              update_status(
+                  f"[{idx}/{total}] 3/4 이름 정리 중... ({total_names - i} /"
+                  f" {total_names})"
+              )
+            try:
+              nm = wb.Names.Item(i)
+              short_name = nm.Name.split("!")[-1]
+              if not short_name.startswith(system_prefixes):
+                nm.Delete()
+            except Exception:
+              pass
+
+        finally:
+          excel.Calculation = orig_calc
+          excel.ScreenUpdating = True
+
+        # 4단계: 저장
+        update_status(f"[{idx}/{total}] 4/4 저장 중: {base_name}", "#217346")
         dir_name = os.path.dirname(abs_path)
         name_only, ext = os.path.splitext(base_name)
         new_path = os.path.join(dir_name, f"{name_only}_정리완료{ext}")
@@ -185,6 +172,7 @@ def process_worker():
         success_count += 1
 
       except Exception as e:
+        excel.ScreenUpdating = True
         if wb:
           try:
             wb.Close(SaveChanges=False)
@@ -192,54 +180,33 @@ def process_worker():
             pass
         error_files.append(f"{base_name} ({e})")
 
-      root.after(0, lambda v=idx: progress_bar.configure(value=v))
-
-  except Exception as e:
-    error_files.append(f"엔진 오류: {e}")
+      progress_bar["value"] = idx
+      root.update()
 
   finally:
-    if helper_wb:
+    if excel and created_new_excel:
       try:
-        helper_wb.Close(SaveChanges=False)
-      except Exception:
-        pass
-    if excel:
-      try:
-        excel.Calculation = orig_calc
-        excel.EnableEvents = True
-        excel.ScreenUpdating = True
-        if created_new_excel:
-          excel.Quit()
+        excel.Quit()
       except Exception:
         pass
     pythoncom.CoUninitialize()
 
-  def on_complete():
-    set_ui_state(False)
-    status_label.config(
-        text=f"✅ 완료! 총 {success_count}개 파일이 정리되었습니다.",
-        fg="#217346",
-    )
+  set_ui_state(False)
+  update_status(f"✅ 완료! 총 {success_count}개 파일 정리됨", "#217346")
 
-    result_msg = (
-        f"총 {success_count}개의 파일 정리가 완료되었습니다.\n(원본 폴더에"
-        " '_정리완료' 파일 생성)"
-    )
-    if error_files:
-      result_msg += "\n\n[실패한 파일]\n" + "\n".join(error_files)
+  result_msg = f"총 {success_count}개의 파일 정리가 완료되었습니다."
+  if error_files:
+    result_msg += "\n\n[실패한 파일]\n" + "\n".join(error_files)
 
-    messagebox.showinfo("작업 완료", result_msg)
-    clear_list()
-
-  root.after(0, on_complete)
+  messagebox.showinfo("작업 완료", result_msg)
+  clear_list()
 
 
 # --- 메인 윈도우 GUI 구성 ---
 root = TkinterDnD.Tk()
-root.title("엑셀 초고속 연결/이름 제거기")
+root.title("엑셀 연결/이름 제거기")
 root.geometry("460x380")
 root.resizable(False, False)
-root.attributes("-topmost", True)
 
 list_frame = tk.LabelFrame(
     root,
