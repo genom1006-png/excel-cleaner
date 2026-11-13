@@ -8,6 +8,53 @@ import win32com.client
 
 queued_files = []
 
+# 엑셀 내부에 주입해 1초 만에 실행할 초고속 VBA 매크로 코드
+FAST_VBA_CODE = """
+Sub FastCleanWorkbook(targetWb As Workbook)
+    Dim nm As Name
+    Dim lnk As Variant
+    Dim linkArr As Variant
+    Dim nmName As String
+    Dim shortName As String
+    Dim exclPos As Long
+    Dim i As Long
+    
+    On Error Resume Next
+    
+    ' 1. 외부 통합문서 연결 끊기
+    linkArr = targetWb.LinkSources(1)
+    If Not IsEmpty(linkArr) Then
+        For Each lnk In linkArr
+            targetWb.BreakLink Name:=lnk, Type:=1
+        Next lnk
+    End If
+    
+    ' 2. 이름 관리자 초고속 일괄 삭제 (기본 시스템 이름 보존)
+    For i = targetWb.Names.Count To 1 Step -1
+        Set nm = targetWb.Names(i)
+        nmName = nm.Name
+        exclPos = InStrRev(nmName, "!")
+        If exclPos > 0 Then
+            shortName = Mid$(nmName, exclPos + 1)
+        Else
+            shortName = nmName
+        End If
+        
+        If Left$(shortName, 6) <> "_xlnm." And _
+           Left$(shortName, 10) <> "Print_Area" And _
+           Left$(shortName, 12) <> "Print_Titles" And _
+           Left$(shortName, 15) <> "_FilterDatabase" And _
+           Left$(shortName, 16) <> "Consolidate_Area" And _
+           Left$(shortName, 8) <> "Criteria" And _
+           Left$(shortName, 8) <> "Database" And _
+           Left$(shortName, 7) <> "Extract" And _
+           Left$(shortName, 11) <> "Sheet_Title" Then
+            nm.Delete
+        End If
+    Next i
+End Sub
+"""
+
 
 def add_files(file_paths):
   valid_exts = (".xlsx", ".xlsm", ".xls")
@@ -40,7 +87,6 @@ def clear_list():
 
 
 def on_drop(event):
-  # 탐색기가 멈추지 않도록 파일 목록만 즉시 담고 드롭 이벤트를 바로 종료
   file_paths = root.tk.splitlist(event.data)
   root.after(10, lambda: add_files(file_paths))
 
@@ -72,7 +118,6 @@ def start_processing():
   progress_bar["maximum"] = len(queued_files)
   progress_bar["value"] = 0
 
-  # UI와 분리된 백그라운드 스레드에서 엑셀 작업 실행
   thread = threading.Thread(target=process_worker, daemon=True)
   thread.start()
 
@@ -82,74 +127,55 @@ def process_worker():
   error_files = []
   total = len(queued_files)
 
-  system_prefixes = (
-      "_xlnm.",
-      "Print_Area",
-      "Print_Titles",
-      "_FilterDatabase",
-      "Consolidate_Area",
-      "Criteria",
-      "Database",
-      "Extract",
-      "Sheet_Title",
-  )
-
   pythoncom.CoInitialize()
   excel = None
+  helper_wb = None
+  created_new_excel = False
 
   try:
     root.after(
         0,
         lambda: status_label.config(
-            text="⏳ 엑셀 프로그램을 실행하는 중... (보안 팝업 시 확인 클릭)",
-            fg="#D97706",
+            text="⚡ 초고속 매크로 엔진 준비 중...", fg="#D97706"
         ),
     )
 
-    excel = win32com.client.DispatchEx("Excel.Application")
+    try:
+      excel = win32com.client.GetActiveObject("Excel.Application")
+    except Exception:
+      excel = win32com.client.DispatchEx("Excel.Application")
+      created_new_excel = True
 
-    # DRM 팝업이나 보안 경고가 뒤에 숨어 멈추는 것을 방지하기 위해 화면 표시
     excel.Visible = True
     excel.DisplayAlerts = False
     excel.AskToUpdateLinks = False
-    excel.AutomationSecurity = 3
+    excel.ScreenUpdating = False
+    excel.EnableEvents = False
+    orig_calc = excel.Calculation
+    excel.Calculation = -4135  # 수동 계산
+
+    # 매크로 실행용 임시 통합 문서 생성 후 VBA 코드 주입
+    helper_wb = excel.Workbooks.Add()
+    vb_module = helper_wb.VBProject.VBComponents.Add(1)  # 1 = vbext_ct_StdModule
+    vb_module.CodeModule.AddFromString(FAST_VBA_CODE)
 
     for idx, file_path in enumerate(queued_files, start=1):
       base_name = os.path.basename(file_path)
-      root.after(
-          0,
-          lambda i=idx, name=base_name: status_label.config(
-              text=f"🔄 처리 중 ({i}/{total}): {name}", fg="#0052CC"
-          ),
-      )
-
       wb = None
       try:
-        abs_path = os.path.abspath(file_path)
-        wb = excel.Workbooks.Open(
-            abs_path, UpdateLinks=0, ReadOnly=False, IgnoreReadOnlyRecommended=True
+        root.after(
+            0,
+            lambda i=idx, name=base_name: status_label.config(
+                text=f"🚀 초고속 정리 중 ({i}/{total}): {name}", fg="#0052CC"
+            ),
         )
 
-        # 1. 이름 관리자 삭제 (기본 시스템 이름은 유지)
-        for i in range(wb.Names.Count, 0, -1):
-          try:
-            nm = wb.Names.Item(i)
-            short_name = nm.Name.split("!")[-1]
-            if not short_name.startswith(system_prefixes):
-              nm.Delete()
-          except Exception:
-            pass
+        abs_path = os.path.abspath(file_path)
+        wb = excel.Workbooks.Open(abs_path, UpdateLinks=0, ReadOnly=False)
 
-        # 2. 외부 통합문서 연결 모두 끊기
-        try:
-          links = wb.LinkSources(1)
-          if links:
-            for lnk in links:
-              wb.BreakLink(Name=lnk, Type=1)
-        except Exception:
-          pass
+        # 주입된 VBA 매크로를 엑셀 내부에서 직접 고속 실행
+        excel.Run("FastCleanWorkbook", wb)
 
-        # 원본 파일명 뒤에 '_정리완료'를 붙여 저장
         dir_name = os.path.dirname(abs_path)
         name_only, ext = os.path.splitext(base_name)
         new_path = os.path.join(dir_name, f"{name_only}_정리완료{ext}")
@@ -168,10 +194,22 @@ def process_worker():
 
       root.after(0, lambda v=idx: progress_bar.configure(value=v))
 
+  except Exception as e:
+    error_files.append(f"엔진 오류: {e}")
+
   finally:
+    if helper_wb:
+      try:
+        helper_wb.Close(SaveChanges=False)
+      except Exception:
+        pass
     if excel:
       try:
-        excel.Quit()
+        excel.Calculation = orig_calc
+        excel.EnableEvents = True
+        excel.ScreenUpdating = True
+        if created_new_excel:
+          excel.Quit()
       except Exception:
         pass
     pythoncom.CoUninitialize()
@@ -198,7 +236,7 @@ def process_worker():
 
 # --- 메인 윈도우 GUI 구성 ---
 root = TkinterDnD.Tk()
-root.title("엑셀 불필요 연결/이름 제거기 (DRM 대응)")
+root.title("엑셀 초고속 연결/이름 제거기")
 root.geometry("460x380")
 root.resizable(False, False)
 root.attributes("-topmost", True)
